@@ -238,7 +238,7 @@ static bool Ensure_Prescale_Target(int width, int height)
 /// <param name="renderer">Which graphics API to ask for, or auto to let bgfx decide.</param>
 /// <param name="vsync">Should presents wait for the display's refresh?</param>
 /// <returns>bool; Did the renderer start?</returns>
-bool Backend_Init(HWND window, int windowwidth, int windowheight, BackendRenderer renderer, bool vsync)
+bool Backend_Init(NativeWindowHandle window, int windowwidth, int windowheight, BackendRenderer renderer, bool vsync)
 {
 	if (_Initialized) {
 		return(true);

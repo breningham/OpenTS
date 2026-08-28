@@ -13,7 +13,11 @@
 
 #pragma once
 
-#include <windows.h>
+
+// bgfx's own platform data takes the native window handle as an opaque void*, so this
+// interface stays free of a platform header; the caller's real window-handle type
+// converts to NativeWindowHandle implicitly.
+using NativeWindowHandle = void *;
 
 
 enum BackendRenderer {
@@ -32,7 +36,7 @@ enum BackendScaleMode {
 };
 
 
-bool Backend_Init(HWND window, int windowwidth, int windowheight, BackendRenderer renderer, bool vsync);
+bool Backend_Init(NativeWindowHandle window, int windowwidth, int windowheight, BackendRenderer renderer, bool vsync);
 void Backend_Shutdown(void);
 
 bool Backend_Set_Frame_Size(int width, int height);
