@@ -48,28 +48,10 @@
 #include "surface.h"
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 bool	InterpolationPaletteChanged = false;
-extern "C" {
-extern void __cdecl Asm_Interpolate (unsigned char* src_ptr ,
-						 						unsigned char* dest_ptr ,
-												int				lines ,
-												int				src_width ,
-												int				dest_width);
-
-extern void __cdecl Asm_Interpolate_Line_Double (unsigned char* src_ptr ,
-						 						unsigned char* dest_ptr ,
-												int				lines ,
-												int				src_width ,
-												int				dest_width);
-
-extern void __cdecl Asm_Interpolate_Line_Interpolate (unsigned char* src_ptr ,
-						 						unsigned char* dest_ptr ,
-												int				lines ,
-												int				src_width ,
-												int				dest_width);
-
-}
 
 extern "C"{
 	unsigned char PaletteInterpolationTable[SIZE_OF_PALETTE][SIZE_OF_PALETTE];
@@ -149,11 +131,6 @@ void Write_Interpolation_Palette (char const * palette_file_name)
  *=========================================================================*/
 void Create_Palette_Interpolation_Table( void )
 {
-
-//	Asm_Create_Palette_Interpolation_Table();
-
-	#if (1)
-
 	int 				i;
 	int 				j;
 	int 				p;
@@ -237,7 +214,6 @@ void Create_Palette_Interpolation_Table( void )
 		}
 	}
 
-	#endif
 	InterpolationPaletteChanged = FALSE;
 	return;
 
@@ -281,6 +257,103 @@ void Increase_Palette_Luminance (PaletteClass & palette , double percentage)
 
 
 int	CopyType	=0;
+
+namespace {
+
+// Horizontally interpolates one source line to double width: out[2k] is the
+// source pixel itself, out[2k+1] is its blend with the next pixel (0 past the
+// last pixel, which has no next).
+void Interpolate_Single_Line(unsigned char const * source, unsigned char * dest, int source_width)
+{
+	for (int k = 0; k < source_width; k++) {
+		dest[2 * k] = source[k];
+		dest[2 * k + 1] = (k + 1 < source_width) ? PaletteInterpolationTable[source[k + 1]][source[k]] : 0;
+	}
+}
+
+// Blends two already horizontally-interpolated (double-width) lines pixel by pixel.
+void Interpolate_Between_Lines(unsigned char const * line1, unsigned char const * line2, unsigned char * dest, int source_width)
+{
+	int count = source_width * 2;
+	for (int i = 0; i < count; i++) {
+		dest[i] = PaletteInterpolationTable[line2[i]][line1[i]];
+	}
+}
+
+}
+
+
+/// <summary>
+/// Stretches a buffer horizontally to double width by interpolating each line, without any
+/// vertical interpolation between lines.
+/// </summary>
+void Asm_Interpolate(unsigned char * src_ptr, unsigned char * dest_ptr, int lines, int src_width, int dest_width)
+{
+	for (int y = 0; y < lines; y++) {
+		Interpolate_Single_Line(src_ptr, dest_ptr, src_width);
+		src_ptr += src_width;
+		dest_ptr += dest_width;
+	}
+}
+
+
+/// <summary>
+/// Stretches a buffer to double width and double height, duplicating each horizontally
+/// interpolated line into two consecutive destination rows.
+/// </summary>
+void Asm_Interpolate_Line_Double(unsigned char * src_ptr, unsigned char * dest_ptr, int lines, int src_width, int dest_width)
+{
+	int row_stride = dest_width / 2;
+	for (int y = 0; y < lines; y++) {
+		Interpolate_Single_Line(src_ptr, dest_ptr, src_width);
+		memcpy(dest_ptr + row_stride, dest_ptr, (size_t)2 * src_width);
+		src_ptr += src_width;
+		dest_ptr += dest_width;
+	}
+}
+
+
+/// <summary>
+/// Stretches a buffer to double width and double height, blending each pair of adjacent
+/// horizontally interpolated source lines into an extra vertically interpolated row between
+/// them, so a run of N source lines yields 2N-1 destination rows.
+/// </summary>
+/// <remarks>The inherited assembly wrote its final row by re-interpolating one source line
+/// past the end of the buffer instead of reusing the already-computed last line; fixed here
+/// rather than preserved, since it read past the caller's buffer.</remarks>
+void Asm_Interpolate_Line_Interpolate(unsigned char * src_ptr, unsigned char * dest_ptr, int lines, int src_width, int dest_width)
+{
+	if (lines <= 0) {
+		return;
+	}
+
+	int row_stride = dest_width / 2;
+	int row_bytes = src_width * 2;
+
+	std::vector<unsigned char> top_line(row_bytes), bottom_line(row_bytes), blend_line(row_bytes);
+	unsigned char * next_line = top_line.data();
+	unsigned char * last_line = bottom_line.data();
+
+	Interpolate_Single_Line(src_ptr, next_line, src_width);
+	std::swap(next_line, last_line);
+	src_ptr += src_width;
+
+	for (int remaining = lines - 1; remaining > 0; remaining--) {
+		Interpolate_Single_Line(src_ptr, next_line, src_width);
+		Interpolate_Between_Lines(last_line, next_line, blend_line.data(), src_width);
+
+		memcpy(dest_ptr, last_line, row_bytes);
+		dest_ptr += row_stride;
+		memcpy(dest_ptr, blend_line.data(), row_bytes);
+		dest_ptr += row_stride;
+
+		src_ptr += src_width;
+		std::swap(next_line, last_line);
+	}
+
+	memcpy(dest_ptr, last_line, row_bytes);
+}
+
 
 /***************************************************************************
  * INTERPOLATE_2X_SCALE                                                    *
