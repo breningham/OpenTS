@@ -34,6 +34,14 @@
 
 #include <cstring>
 
+// htons/htonl/ntohs/ntohl below are the same POSIX-standard functions on both platforms;
+// only the declaring header differs.
+#ifdef _WIN32
+#include <winsock.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 
 /// <summary>
 /// Creates a field that carries a character value.
