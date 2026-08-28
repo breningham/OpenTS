@@ -19,13 +19,6 @@
 
 #include <algorithm>
 
-extern "C" {
-	void __cdecl Adjust_Color_555(void * palette, void * translator, int red_tint, int green_tint, int blue_tint, int intensity, bool * tint_mask);
-	void __cdecl Adjust_Color_556(void * palette, void * translator, int red_tint, int green_tint, int blue_tint, int intensity, bool * tint_mask);
-	void __cdecl Adjust_Color_565(void * palette, void * translator, int red_tint, int green_tint, int blue_tint, int intensity, bool * tint_mask);
-	void __cdecl Adjust_Color_655(void * palette, void * translator, int red_tint, int green_tint, int blue_tint, int intensity, bool * tint_mask);
-}
-
 bool _default_mask[256] = {
 	true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,
 	true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,
@@ -44,8 +37,6 @@ bool _default_mask[256] = {
 	true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,
 	true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,
 };
-
-DSurfaceColorMode PrimaryColorMode = COLORMODE_INVALID;
 
 
 /// <summary>
@@ -74,10 +65,6 @@ LightConvertClass::LightConvertClass(PaletteClass const & artpalette, PaletteCla
 	if (IntensityLevels >= 1) {
 		if (tint_mask == NULL) {
 			TintMask = _default_mask;
-		}
-
-		if (PrimaryColorMode == COLORMODE_INVALID) {
-			PrimaryColorMode = (DSurfaceColorMode)DSurface::Get_Primary_Color_Mode();
 		}
 
 		if (IonStormClass::Is_Ion_Storm_Active()) {
@@ -195,47 +182,23 @@ void LightConvertClass::Apply_Tint(int red_tint, int green_tint, int blue_tint, 
 					interp_intensity = 0x10000;
 				}
 
-				switch (PrimaryColorMode) {
-					case COLORMODE_555:
-						Adjust_Color_555((void *)&ArtPalette, translator, interp_red, interp_green, interp_blue, interp_intensity, TintMask);
-						translator += PaletteClass::COLOR_COUNT;
-						break;
-
-					case COLORMODE_556:
-						Adjust_Color_556((void *)&ArtPalette, translator, interp_red, interp_green, interp_blue, interp_intensity, TintMask);
-						translator += PaletteClass::COLOR_COUNT;
-						break;
-
-					case COLORMODE_565:
-						Adjust_Color_565((void *)&ArtPalette, translator, interp_red, interp_green, interp_blue, interp_intensity, TintMask);
-						translator += PaletteClass::COLOR_COUNT;
-						break;
-
-					case COLORMODE_655:
-						Adjust_Color_655((void *)&ArtPalette, translator, interp_red, interp_green, interp_blue, interp_intensity, TintMask);
-						translator += PaletteClass::COLOR_COUNT;
-						break;
-
-					default:
-						*translator = 0;
-						translator++;
-						for (int i = 1; i < PaletteClass::COLOR_COUNT; i++) {
-							if (TintMask[i]) {
-								red_tint   = (interp_red   * (unsigned char)ArtPalette[i].Get_Red()) >> 16;
-								green_tint = (interp_green * (unsigned char)ArtPalette[i].Get_Green()) >> 16;
-								blue_tint  = (interp_blue   * (unsigned char)ArtPalette[i].Get_Blue()) >> 16;
-							} else {
-								red_tint   = (interp_intensity * (unsigned char)ArtPalette[i].Get_Red()) >> 16;
-								green_tint = (interp_intensity * (unsigned char)ArtPalette[i].Get_Green()) >> 16;
-								blue_tint  = (interp_intensity * (unsigned char)ArtPalette[i].Get_Blue()) >> 16;
-							}
-							red_tint = std::min(red_tint, 255);
-							green_tint = std::min(green_tint, 255);
-							blue_tint = std::min(blue_tint, 255);
-							*translator = DSurface::Build_Hicolor_Pixel(red_tint, green_tint, blue_tint);
-							translator++;
-						}
-						break;
+				*translator = 0;
+				translator++;
+				for (int i = 1; i < PaletteClass::COLOR_COUNT; i++) {
+					if (TintMask[i]) {
+						red_tint   = (interp_red   * (unsigned char)ArtPalette[i].Get_Red()) >> 16;
+						green_tint = (interp_green * (unsigned char)ArtPalette[i].Get_Green()) >> 16;
+						blue_tint  = (interp_blue   * (unsigned char)ArtPalette[i].Get_Blue()) >> 16;
+					} else {
+						red_tint   = (interp_intensity * (unsigned char)ArtPalette[i].Get_Red()) >> 16;
+						green_tint = (interp_intensity * (unsigned char)ArtPalette[i].Get_Green()) >> 16;
+						blue_tint  = (interp_intensity * (unsigned char)ArtPalette[i].Get_Blue()) >> 16;
+					}
+					red_tint = std::min(red_tint, 255);
+					green_tint = std::min(green_tint, 255);
+					blue_tint = std::min(blue_tint, 255);
+					*translator = DSurface::Build_Hicolor_Pixel(red_tint, green_tint, blue_tint);
+					translator++;
 				}
 				red_accum += 2 * red_step;
 				green_accum += 2 * green_step;
