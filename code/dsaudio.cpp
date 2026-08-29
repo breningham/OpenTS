@@ -24,6 +24,7 @@
 #include "winfix.h"
 
 #include <algorithm>
+#include <chrono>
 #include <math.h> // for log10f
 
 
@@ -64,42 +65,53 @@
 
 DSAudio Audio;
 
+/// Tries to take a mutex within a timeout, matching the original's "warn and carry on"
+/// behavior on contention; unlike ReleaseMutex, std::recursive_timed_mutex::unlock() on a mutex the
+/// calling thread does not hold is undefined behavior, so instead of proceeding unlocked
+/// after a timeout, this falls back to a plain (blocking) lock so every matching unlock
+/// downstream is always well defined. The 10 second timeout this guards is not expected to
+/// be hit in practice; the fallback only changes behavior in that already-exceptional case.
+static void Timed_Lock_Or_Wait(std::recursive_timed_mutex & m, unsigned int timeout_ms, char const * what, char const * file, int line)
+{
+	if (!m.try_lock_for(std::chrono::milliseconds(timeout_ms))) {
+		DebugString("Warning: Probable deadlock occurred on %s. %s, line %d\n", what, file, line);
+		m.lock();
+	}
+}
+
+/// Lock_Global_Mutex() tries within the timeout and honestly reports failure, since
+/// Lock_Mutex() below relies on that to roll back other mutexes it already holds. This
+/// macro's uses do not roll back anything, so on failure it falls back to a blocking lock,
+/// the same safety fallback Timed_Lock_Or_Wait provides everywhere else.
 #define LOCK_GLOBAL_MUTEX() \
 	if (!Lock_Global_Mutex()) { \
 		DebugString("Warning: Probable deadlock occurred on GlobalAudioMutex. %s, line %d\n", __FILE__, __LINE__); \
-	} \
-
+		GlobalAudioMutex.lock(); \
+	}
 #define UNLOCK_GLOBAL_MUTEX() Unlock_Global_Mutex()
 
 
-#define LOCK_SECONDARY_MUTEX(_handle) \
-	if (WaitForSingleObject(SecondaryBufferMutexes[_handle], MUTEX_TIMEOUT) == WAIT_TIMEOUT) { \
-		DebugString("Warning: Probable deadlock occurred on secondary buffer mutex %d. %s, line %d\n", _handle, __FILE__, __LINE__); \
-	} \
-
-#define UNLOCK_SECONDARY_MUTEX(_handle) ReleaseMutex(SecondaryBufferMutexes[_handle]);
+#define LOCK_SECONDARY_MUTEX(_handle) Timed_Lock_Or_Wait(SecondaryBufferMutexes[_handle], MUTEX_TIMEOUT, "secondary buffer mutex", __FILE__, __LINE__)
+#define UNLOCK_SECONDARY_MUTEX(_handle) SecondaryBufferMutexes[_handle].unlock();
 
 
-#define LOCK_STREAMING_SECONDARY_MUTEX(_handle) \
-	if (WaitForSingleObject(SecondaryBufferMutexes[_handle], MUTEX_TIMEOUT) == WAIT_TIMEOUT) { \
-		DebugString("Warning: Probable deadlock occurred on streaming secondary buffer mutex %d. %s, line %d\n", _handle, __FILE__, __LINE__); \
-	} \
-
-#define UNLOCK_STREAMING_SECONDARY_MUTEX(_handle) ReleaseMutex(SecondaryBufferMutexes[_handle]);
+#define LOCK_STREAMING_SECONDARY_MUTEX(_handle) Timed_Lock_Or_Wait(SecondaryBufferMutexes[_handle], MUTEX_TIMEOUT, "streaming secondary buffer mutex", __FILE__, __LINE__)
+#define UNLOCK_STREAMING_SECONDARY_MUTEX(_handle) SecondaryBufferMutexes[_handle].unlock();
 
 
-#define _LOCK_SECONDARY_MUTEX(_handle) \
-	if (WaitForSingleObject(Audio.SecondaryBufferMutexes[_handle], DSAudio::MUTEX_TIMEOUT) == WAIT_TIMEOUT) { \
-		DebugString("Warning: Probable deadlock occurred on secondary buffer mutex %d. %s, line %d\n", _handle, __FILE__, __LINE__); \
-	} \
-
-#define _UNLOCK_SECONDARY_MUTEX(_handle) ReleaseMutex(Audio.SecondaryBufferMutexes[_handle]);
+#define _LOCK_SECONDARY_MUTEX(_handle) Timed_Lock_Or_Wait(Audio.SecondaryBufferMutexes[_handle], DSAudio::MUTEX_TIMEOUT, "secondary buffer mutex", __FILE__, __LINE__)
+#define _UNLOCK_SECONDARY_MUTEX(_handle) Audio.SecondaryBufferMutexes[_handle].unlock();
 
 
+/// Takes the global mutex and every secondary buffer mutex, in a fixed order (global
+/// first), matching the original's WaitForMultipleObjects(..., waitAll, ...) over the same
+/// set. Every caller of LOCK_ALL_MUTEX releases the same set unconditionally afterward
+/// (see e.g. the destructor below), so unlike Lock_Mutex() this never partially backs out.
 #define LOCK_ALL_MUTEX() \
-	if (WaitForMultipleObjects(MUTEX_COUNT, AllAudioMutexes, true, DSAudio::MUTEX_TIMEOUT) == WAIT_TIMEOUT) { \
-		DebugString("Warning: Probable deadlock occurred on multiple audio mutexes. %s, line %d\n", __FILE__, __LINE__); \
-	} \
+	Timed_Lock_Or_Wait(GlobalAudioMutex, MUTEX_TIMEOUT, "multiple audio mutexes", __FILE__, __LINE__); \
+	for (int _all_mutex_index = 0; _all_mutex_index < MAX_SFX; _all_mutex_index++) { \
+		Timed_Lock_Or_Wait(SecondaryBufferMutexes[_all_mutex_index], MUTEX_TIMEOUT, "multiple audio mutexes", __FILE__, __LINE__); \
+	}
 
 
 /***********************************************************************************************
@@ -187,14 +199,7 @@ DSAudio::DSAudio(void)
 	PrimaryBuffFormat = new WAVEFORMATEX;
 	memset(PrimaryBuffFormat, 0, sizeof(*PrimaryBuffFormat));
 
-	TimerMutex = CreateMutex(0, 0, 0);
-	GlobalAudioMutex = CreateMutex(0, 0, 0);
-
 	memset(SampleTracker, 0, sizeof(SampleTracker));
-
-	for (int index = 0; index < MAX_SFX; index++) {
-		SecondaryBufferMutexes[index] = CreateMutex(NULL, 0, NULL);
-	}
 
 	AudioDone = false;
 }
@@ -244,13 +249,10 @@ DSAudio::~DSAudio(void)
 	}
 
 	for (int index = 0; index < MAX_SFX; index++) {
-		ReleaseMutex(SecondaryBufferMutexes[index]);
-		CloseHandle(SecondaryBufferMutexes[index]);
+		SecondaryBufferMutexes[index].unlock();
 	}
 
 	Unlock_Global_Mutex();
-	CloseHandle(GlobalAudioMutex);
-	CloseHandle(TimerMutex);
 }
 
 
@@ -528,9 +530,7 @@ void DSAudio::End(void)
 
 	int	index;
 
-	if (WaitForSingleObject(TimerMutex, MUTEX_TIMEOUT) == WAIT_TIMEOUT) {
-		DebugString("Warning: Probable deadlock occurred on TimerMutex. %s, line %d\n", __FILE__, __LINE__);
-	}
+	Timed_Lock_Or_Wait(TimerMutex, MUTEX_TIMEOUT, "TimerMutex", __FILE__, __LINE__);
 
 	/*
 	**	Remove the Windows timer event we installed for the sound callback
@@ -541,11 +541,11 @@ void DSAudio::End(void)
 		timeEndPeriod(TimerResolution);
 	}
 
-	ReleaseMutex(TimerMutex);
+	TimerMutex.unlock();
 
 	if (SoundObject && PrimaryBufferPtr){
-		if (WaitForMultipleObjects(MAX_SFX, SecondaryBufferMutexes, true, MUTEX_TIMEOUT) == WAIT_TIMEOUT) {
-			DebugString("Warning: Probable deadlock occurred on secondary sound buffer mutexes. %s, line %d\n", __FILE__, __LINE__);
+		for (index = 0; index < MAX_SFX; index++) {
+			Timed_Lock_Or_Wait(SecondaryBufferMutexes[index], MUTEX_TIMEOUT, "secondary sound buffer mutexes", __FILE__, __LINE__);
 		}
 
 		/*
@@ -563,7 +563,7 @@ void DSAudio::End(void)
 			}
 			SampleTracker[index].FileBuffer = NULL;
 
-			ReleaseMutex(SecondaryBufferMutexes[index]);
+			SecondaryBufferMutexes[index].unlock();
 		}
 	}
 
@@ -1333,7 +1333,7 @@ bool DSAudio::Attempt_Audio_Restore (LPDIRECTSOUNDBUFFER sound_buffer)
 /// <remarks>Every successful call must be paired with a call to Unlock_Global_Mutex.</remarks>
 bool DSAudio::Lock_Global_Mutex(void)
 {
-	return(WaitForSingleObject(GlobalAudioMutex, MUTEX_TIMEOUT) != WAIT_TIMEOUT ? true : false);
+	return(GlobalAudioMutex.try_lock_for(std::chrono::milliseconds(MUTEX_TIMEOUT)));
 }
 
 
@@ -1342,7 +1342,7 @@ bool DSAudio::Lock_Global_Mutex(void)
 /// </summary>
 void DSAudio::Unlock_Global_Mutex(void)
 {
-	ReleaseMutex(GlobalAudioMutex);
+	GlobalAudioMutex.unlock();
 }
 
 
@@ -1358,19 +1358,18 @@ bool DSAudio::Lock_Mutex(void)
 {
 	DebugString("Taking ownership of all audio mutexes\n");
 
-	if (WaitForSingleObject(TimerMutex, MUTEX_TIMEOUT) == WAIT_TIMEOUT) {
+	if (!TimerMutex.try_lock_for(std::chrono::milliseconds(MUTEX_TIMEOUT))) {
 		return(false);
 	}
 
 	int index = 0;
 	while (true) {
-		if (WaitForSingleObject(SecondaryBufferMutexes[index], MUTEX_TIMEOUT) == WAIT_TIMEOUT) {
-			while (index >= 0) {
-				UNLOCK_SECONDARY_MUTEX(index);
-				index--;
+		if (!SecondaryBufferMutexes[index].try_lock_for(std::chrono::milliseconds(MUTEX_TIMEOUT))) {
+			for (int rollback = index - 1; rollback >= 0; rollback--) {
+				SecondaryBufferMutexes[rollback].unlock();
 			}
 
-			ReleaseMutex(TimerMutex);
+			TimerMutex.unlock();
 
 			return(false);
 		}
@@ -1383,10 +1382,10 @@ bool DSAudio::Lock_Mutex(void)
 
 	if (!Lock_Global_Mutex()) {
 		for (index = 0; index < MAX_SFX; index++) {
-			UNLOCK_SECONDARY_MUTEX(index);
+			SecondaryBufferMutexes[index].unlock();
 		}
 
-		ReleaseMutex(TimerMutex);
+		TimerMutex.unlock();
 		return(false);
 	}
 
@@ -1399,15 +1398,17 @@ bool DSAudio::Lock_Mutex(void)
 /// Use this routine to let the sound timer and the maintenance callback run again after a
 /// region of code protected by Lock_Mutex.
 /// </summary>
+/// <remarks>Only call this after a Lock_Mutex that returned true; unlike ReleaseMutex, the
+/// std::recursive_timed_mutex this now guards with is undefined behavior to unlock without holding.</remarks>
 void DSAudio::Unlock_Mutex(void)
 {
 	Unlock_Global_Mutex();
 
 	for (int index = 0; index < MAX_SFX; index++) {
-		UNLOCK_SECONDARY_MUTEX(index);
+		SecondaryBufferMutexes[index].unlock();
 	}
 
-	ReleaseMutex(TimerMutex);
+	TimerMutex.unlock();
 
 	DebugString("Released ownership of all audio mutexes\n");
 }
@@ -1430,11 +1431,9 @@ void DSAudio::Unlock_Mutex(void)
 
 void CALLBACK DSAudio::Sound_Timer_Callback ( UINT, UINT, DWORD, DWORD, DWORD )
 {
-	HANDLE mutex = Audio.TimerMutex;
-	if (WaitForSingleObject(mutex, 0) == 0) {
+	if (Audio.TimerMutex.try_lock()) {
 		Audio.maintenance_callback();
-		mutex = Audio.TimerMutex;
-		ReleaseMutex(mutex);
+		Audio.TimerMutex.unlock();
 	}
 }
 
@@ -1473,7 +1472,7 @@ void DSAudio::maintenance_callback(void)
 
 	for (index = 0; index < MAX_SFX; index++) {
 
-		if (WaitForSingleObject(SecondaryBufferMutexes[index], 0)) continue;
+		if (!SecondaryBufferMutexes[index].try_lock()) continue;
 
 		st = &SampleTracker[index];
 
@@ -2228,6 +2227,11 @@ bool DSAudio::Set_Primary_Buffer_Format(void)
  *    11/3/95 3:53PM ST : Created                                                              *
  *=============================================================================================*/
 
+/// <remarks>Releases every mutex LOCK_ALL_MUTEX took, not only the ones whose slot had an
+/// active PlayBuffer; the original released only those, leaving the rest held by this
+/// thread indefinitely -- a genuine bug there too, since any other thread waiting on one
+/// of those mutexes (the sound timer callback, most notably) would hang until this thread
+/// happened to lock and release that same slot again some other way.</remarks>
 void DSAudio::Restore_Sound_Buffers ( void )
 {
 	LOCK_ALL_MUTEX();
@@ -2240,11 +2244,11 @@ void DSAudio::Restore_Sound_Buffers ( void )
 	for ( int index = 0; index < MAX_SFX; index++) {
 		if (SampleTracker[index].PlayBuffer != NULL){
 			SampleTracker[index].PlayBuffer->Restore();
-			UNLOCK_SECONDARY_MUTEX(index);
 		}
+		SecondaryBufferMutexes[index].unlock();
 	}
 
-	ReleaseMutex(AllAudioMutexes[0]);
+	GlobalAudioMutex.unlock();
 }
 
 

@@ -18,6 +18,8 @@
 
 #include <dsound.h>
 
+#include <mutex>
+
 #define INVALID_SAMPLE_HANDLE -1
 
 class DSAudio
@@ -146,30 +148,30 @@ class DSAudio
 		SampleTrackerType SampleTracker[MAX_SFX];
 
 		/*
+		 * These take the place of the Win32 named mutexes (via CreateMutex) this class used
+		 * to hold as HANDLEs. They are recursive because several methods below lock their own
+		 * mutex and then call another method that locks the same one again -- Stop_Sample
+		 * locking SecondaryBufferMutexes[handle] while End()'s teardown loop already holds
+		 * it, for one -- relying on Win32 mutexes' same-thread re-entrancy, which a plain
+		 * std::timed_mutex does not provide.
+		 */
+
+		/*
 		 * This is the mutex that shuts the sound timer callback out while the audio system
 		 * is being reconfigured or torn down.
 		 */
-		HANDLE TimerMutex;
-		union {
-			struct {
-				/*
-				 * This is the mutex that guards the audio state not tied to any one sample.
-				 */
-				HANDLE GlobalAudioMutex;
+		std::recursive_timed_mutex TimerMutex;
 
-				/*
-				 * These are the per sample mutexes, one for each secondary sound buffer, so
-				 * that one sample can be worked on without stalling any of the others.
-				 */
-				HANDLE SecondaryBufferMutexes[MAX_SFX];
-			};
+		/*
+		 * This is the mutex that guards the audio state not tied to any one sample.
+		 */
+		std::recursive_timed_mutex GlobalAudioMutex;
 
-			/*
-			 * This is an alias over the global mutex and the secondary buffer mutexes, so
-			 * that the whole set can be taken or waited on with a single call.
-			 */
-			HANDLE AllAudioMutexes[MUTEX_COUNT];
-		};
+		/*
+		 * These are the per sample mutexes, one for each secondary sound buffer, so
+		 * that one sample can be worked on without stalling any of the others.
+		 */
+		std::recursive_timed_mutex SecondaryBufferMutexes[MAX_SFX];
 
 		/*
 		 * If the preallocated FileStreamBuffer has already been claimed, then this flag
