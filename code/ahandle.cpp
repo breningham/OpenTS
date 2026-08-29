@@ -34,10 +34,15 @@ Ahandle _handles[Ahandle::MAX_HANDLES];
 /// Kept outside Ahandle itself: Open_Audio_Handler memsets the whole struct on every
 /// reopen, which would corrupt a std::mutex/std::atomic member instead of just
 /// re-zeroing it.
-static std::mutex _handle_mutexes[Ahandle::MAX_HANDLES];
+///
+/// Recursive because Start_Audio_Handler locks a handle's mutex and then, still
+/// holding it, calls _AHandleCallbackFunc1, which re-enters Stream_Audio_Handler
+/// and locks the same handle's mutex again -- relying on CRITICAL_SECTION's
+/// same-thread re-entrancy, which a plain std::mutex does not provide.
+static std::recursive_mutex _handle_mutexes[Ahandle::MAX_HANDLES];
 static std::atomic<long> _handle_suspend_audio_callback[Ahandle::MAX_HANDLES];
 
-inline std::mutex & Handle_Mutex(Ahandle const * handle)
+inline std::recursive_mutex & Handle_Mutex(Ahandle const * handle)
 {
 	return _handle_mutexes[handle - _handles];
 }
@@ -250,7 +255,7 @@ long __cdecl Open_Audio_Handler(VQAHandleP *vqap, AhandleInitParams *params, lon
 		dscaps.dwSize = sizeof(DSCAPS);
 
 		DebugString("Audio.Lock_Mutex\n");
-		Audio.Lock_Mutex();
+		bool audio_mutex_locked = Audio.Lock_Mutex();
 
 		Direct_Sound_Object()->GetCaps(&dscaps);
 
@@ -289,7 +294,9 @@ long __cdecl Open_Audio_Handler(VQAHandleP *vqap, AhandleInitParams *params, lon
 		}
 
 		DebugString("Audio.Unlock_Mutex\n");
-		Audio.Unlock_Mutex();
+		if (audio_mutex_locked) {
+			Audio.Unlock_Mutex();
+		}
 
 		handle->Channels = params->Channels;
 		handle->BitsPerSample = params->BitsPerSample;
@@ -340,7 +347,7 @@ long __cdecl Close_Audio_Handler(VQAHandleP *vqap)
 			_restore_primary = false;
 
 			DebugString("Audio.Lock_Mutex()\n");
-			Audio.Lock_Mutex();
+			bool audio_mutex_locked = Audio.Lock_Mutex();
 
 			DebugString("Stopping primary buffer\n");
 			Audio.Stop_Primary_Sound_Buffer();
@@ -351,7 +358,9 @@ long __cdecl Close_Audio_Handler(VQAHandleP *vqap)
 			Audio.Start_Primary_Sound_Buffer(false);
 
 			DebugString("Audio.Unlock_Mutex()\n");
-			Audio.Unlock_Mutex();
+			if (audio_mutex_locked) {
+				Audio.Unlock_Mutex();
+			}
 		}
 	}
 
@@ -407,9 +416,11 @@ long __cdecl Start_Audio_Handler(VQAHandleP *vqap)
 	/*
 	**	Create the secondary sound buffer object
 	*/
-	Audio.Lock_Mutex();
+	bool audio_mutex_locked = Audio.Lock_Mutex();
 	Direct_Sound_Object()->CreateSoundBuffer (&audio->BufferDesc , &audio->SecondaryBufferPtr , NULL);
-	Audio.Unlock_Mutex();
+	if (audio_mutex_locked) {
+		Audio.Unlock_Mutex();
+	}
 
 	if (audio->SecondaryBufferPtr == NULL) {
 		Handle_Mutex(audio).unlock();
