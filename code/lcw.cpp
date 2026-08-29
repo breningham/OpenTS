@@ -163,277 +163,175 @@ int LCW_Uncomp(void const * source, void * dest, unsigned long )
 }
 
 
-#if defined(_MSC_VER)
-
-
-/***********************************************************************************************
- * LCW_Comp -- Performes LCW compression on a block of data.                                   *
- *                                                                                             *
- *    This routine will compress a block of data using the LCW compression method. LCW has     *
- *    the primary characteristic of very fast uncompression at the expense of very slow        *
- *    compression times.                                                                       *
- *                                                                                             *
- * INPUT:   source   -- Pointer to the source data to compress.                                *
- *                                                                                             *
- *          dest     -- Pointer to the destination location to store the compressed data       *
- *                      to.                                                                    *
- *                                                                                             *
- *          datasize -- The size (in bytes) of the source data to compress.                    *
- *                                                                                             *
- * OUTPUT:  Returns with the number of bytes of output data stored into the destination        *
- *          buffer.                                                                            *
- *                                                                                             *
- * WARNINGS:   Be sure that the destination buffer is big enough. The maximum size required    *
- *             for the destination buffer is (datasize + datasize/128).                        *
- *                                                                                             *
- * HISTORY:                                                                                    *
- *   05/20/1997 JLB : Created.                                                                 *
- *=============================================================================================*/
-/// Renegade guards this body with #ifdef _WINDOWS, which would force retval ahead of the
-/// other locals; that shape is not reproduced here.
-/*ARGSUSED*/
+/// <summary>
+/// Compresses a block of data using the LCW compression method. LCW has the primary
+/// characteristic of very fast uncompression at the expense of very slow compression
+/// times: for every source byte not already covered by a match, it searches the entire
+/// already-scanned prefix for the longest prior occurrence of the current byte, extends
+/// every candidate to find the best match, and only settles for literal bytes when no
+/// match beats a length of 2. Among equally long candidates, the latest-found one wins.
+/// </summary>
+/// <param name="source">Pointer to the source data to compress.</param>
+/// <param name="dest">Pointer to the destination location to store the compressed data to.</param>
+/// <param name="datasize">The size (in bytes) of the source data to compress.</param>
+/// <returns>The number of bytes of output data stored into the destination buffer.</returns>
+/// <remarks>Be sure the destination buffer is big enough; the maximum size required is
+/// (datasize + datasize/128). Verified bit-exact against the inherited assembly this
+/// replaces, across randomized trials covering literal runs, matches at every length and
+/// offset class, and long constant-byte runs. One divergence was deliberate: the assembly
+/// unconditionally entered its search loop once even when a one-byte datasize had already
+/// consumed the only source byte, reading one byte past the caller's buffer and (confirmed
+/// with a standalone repro) encoding that garbage byte as if it were real data, corrupting
+/// the compressed stream's decoded length. Fixed here rather than preserved, since there is
+/// no defined "correct" value to replicate from an out-of-bounds read.</remarks>
 int LCW_Comp(void const * source, void * dest, int datasize)
 {
-	int inlen = 0;
-	int a1stdest = 0;
-	int a1stsrc = 0;
-	int lenoff = 0;
-	int ndest = 0;
-	int count = 0;
-	int matchoff = 0;
-	int end_of_data = 0;
-	int retval = 0;
-#ifdef _DEBUG
-	inlen = inlen;
-	a1stdest = a1stdest;
-	a1stsrc = a1stsrc;
-	lenoff = lenoff;
-	ndest = ndest;
-	count = count;
-	matchoff = matchoff;
-	end_of_data = end_of_data;
-#endif
+	unsigned char const * esi = (unsigned char const *)source;
+	unsigned char * edi = (unsigned char *)dest;
+	unsigned char const * end_of_data = esi + datasize;
+	unsigned char const * a1stsrc = esi;
+	unsigned char * a1stdest = edi;
+	unsigned char * lenoff = edi;
+	bool inlen = true;
 
-	__asm {
-		cld			// make sure all string commands are forward
-		mov	edi,[dest]
-		mov	esi,[source]
-		mov	edx,[datasize]		// get length of data to compress
+	// The first byte is always sent as a 1-byte literal run.
+	*edi++ = 0x81;
+	*edi++ = *esi++;
 
-// compress data to the following codes in the format b = byte, w = word
-// n = byte code pulled from compressed data
-//   Bit field of n		command		description
-// n=0xxxyyyy,yyyyyyyy		short run	back y bytes and run x+3
-// n=10xxxxxx,n1,n2,...,nx+1	med length	copy the next x+1 bytes
-// n=11xxxxxx,w1			med run		run x+3 bytes from offset w1
-// n=11111111,w1,w2		long run	run w1 bytes from offset w2
-// n=10000000			end		end of data reached
-
-		mov	ebx,esi
-		add	ebx,edx
-		mov	[end_of_data],ebx
-		mov	[inlen],1	//; set the in-length flag
-		mov	[a1stdest],edi	//; save original dest offset for size calc
-		mov	[a1stsrc],esi	//; save offset of first byte of data
-		mov	[lenoff],edi	//; save the offset of the legth of this len
-		sub	eax,eax
-		mov	al,081h		//; the first byte is always a len
-		stosb			//; write out a len of 1
-		lodsb			//; get the byte
-		stosb			//; save it
-	}
+	unsigned char const * searchptr;
+	unsigned int count;
+	unsigned char const * matchoff = nullptr;
 
 loopstart:
-	__asm {
-		mov	[ndest],edi	//; save offset of compressed data
-		mov	edi,[a1stsrc]	//; get the offset to the first byte of data
-		mov	[count],1	//; set the count of run to 0
+	// A datasize of 1 already exhausted the source in the setup above; nothing is left
+	// to search for, and searching would read past the caller's buffer (see remarks).
+	if (esi >= end_of_data) {
+		goto nxt;
 	}
-searchloop:
-	__asm {
-		sub	eax,eax
-		mov	al,[esi]	//; get the current byte of data
-		cmp	al,[esi+64]
-		jne	short notrunlength
+	{
+		unsigned char * ndest = edi;
+		searchptr = a1stsrc;
+		count = 1;
 
-		mov	ebx,edi
+	searchloop:
+		// Fast pre-check for a long run of the current byte: if the byte 64 positions
+		// ahead already matches, it is worth the full bounded scan to measure the run.
+		if (esi + 64 < end_of_data && *esi == esi[64]) {
+			unsigned char const * scan = esi;
+			while (scan < end_of_data && *scan == *esi) {
+				scan++;
+			}
+			if (scan == end_of_data) {
+				scan--;
+			}
+			unsigned int run_length = (unsigned int)(scan - esi);
+			if (run_length >= 65) {
+				unsigned char value = *esi;
+				esi = scan;
+				edi = ndest;
+				*edi++ = 0xFE;
+				*edi++ = (unsigned char)(run_length & 0xFF);
+				*edi++ = (unsigned char)((run_length >> 8) & 0xFF);
+				*edi++ = value;
+				ndest = edi;
+				inlen = false;
+				goto searchloop;
+			}
+		}
 
-		mov	edi,esi
-		mov	ecx,[end_of_data]
-		sub	ecx,edi
-		repe	scasb
-		dec	edi
-		mov	ecx,edi
-		sub	ecx,esi
-		cmp	ecx,65
-		jb	short notlongenough
+	oploop:
+		// Exhaustively search [searchptr, esi) for the longest prior occurrence of the
+		// current byte, keeping the best (and, on ties, latest) candidate found.
+		{
+			unsigned int range = (unsigned int)(esi - searchptr);
+			if (range == 0) {
+				goto searchdone;
+			}
+			unsigned char const * scanptr = searchptr;
+			unsigned char const * found = nullptr;
+			for (unsigned int i = 0; i < range; i++) {
+				if (*scanptr == *esi) {
+					found = scanptr;
+					scanptr++;
+					break;
+				}
+				scanptr++;
+			}
+			if (!found) {
+				goto searchdone;
+			}
+			searchptr = found + 1;
 
-		mov	[inlen],0	//; clear the in-length flag
-//		mov	[DWORD PTR inlen],0	//; clear the in-length flag
-		mov	esi,edi
-		mov	edi,[ndest]	//; get the offset of our compressed data
+			// Cheap rejection: a match can't reach the current best length unless this
+			// single probe byte, one past it, also agrees.
+			if (esi[count - 1] != found[count - 1]) {
+				goto oploop;
+			}
 
-		mov	ah,al
-		mov	al,0FEh
-		stosb
-		xchg	ecx,eax
-		stosw
-		mov	al,ch
-		stosb
+			unsigned char const * probe_src = esi;
+			unsigned char const * probe_cand = found;
+			unsigned int max_len = (unsigned int)(end_of_data - esi);
+			unsigned int matched = 0;
+			while (matched < max_len && *probe_src == *probe_cand) {
+				probe_src++;
+				probe_cand++;
+				matched++;
+			}
 
-		mov	[ndest],edi	//; save offset of compressed data
-		mov	edi,ebx
-		jmp	searchloop
+			if (matched >= count) {
+				count = matched;
+				matchoff = found;
+			}
+			goto searchloop;
+		}
+
+	searchdone:
+		if (count <= 2) {
+			// Not worth a match code; append to (or start) the current literal run.
+			if (!inlen) {
+				lenoff = edi;
+				*edi++ = 0x80;
+			}
+			if (*lenoff == 0xBF) {
+				lenoff = edi;
+				*edi++ = 0x80;
+			}
+			(*lenoff)++;
+			*edi++ = *esi++;
+			inlen = true;
+		} else {
+			unsigned int offset_from_source = (unsigned int)(esi - matchoff);
+			if (count <= 10 && offset_from_source <= 0xFFF) {
+				// Short copy: 3-10 bytes, 12-bit offset.
+				unsigned char op_code = (unsigned char)(((count - 3) << 4) | ((offset_from_source >> 8) & 0x0F));
+				*edi++ = op_code;
+				*edi++ = (unsigned char)(offset_from_source & 0xFF);
+			} else if (count <= 64) {
+				// Medium copy: 3-64 bytes, 16-bit offset from the start of the data.
+				*edi++ = (unsigned char)(0xC0 | (count - 3));
+				unsigned int offset_from_start = (unsigned int)(matchoff - a1stsrc);
+				*edi++ = (unsigned char)(offset_from_start & 0xFF);
+				*edi++ = (unsigned char)((offset_from_start >> 8) & 0xFF);
+			} else {
+				// Long copy: 16-bit length, 16-bit offset from the start of the data.
+				*edi++ = 0xFF;
+				*edi++ = (unsigned char)(count & 0xFF);
+				*edi++ = (unsigned char)((count >> 8) & 0xFF);
+				unsigned int offset_from_start = (unsigned int)(matchoff - a1stsrc);
+				*edi++ = (unsigned char)(offset_from_start & 0xFF);
+				*edi++ = (unsigned char)((offset_from_start >> 8) & 0xFF);
+			}
+			esi += count;
+			inlen = false;
+		}
 	}
-notlongenough:
-	__asm {
-		mov	edi,ebx
-	}
-notrunlength:
-oploop:
-	__asm {
-		mov	ecx,esi		//; get the address of the last byte +1
-		sub	ecx,edi		//; get the total number of bytes left to comp
-		jz	short searchdone
 
-		repne	scasb		//; look for a match
-		jne	short searchdone	//; if we don't find one we're done
-
-		mov	ebx,[count]
-		mov	ah,[esi+ebx-1]
-		cmp	ah,[edi+ebx-2]
-
-		jne	oploop
-
-		mov	edx,esi		//; save this spot for the next search
-		mov	ebx,edi		//; save this spot for the length calc
-		dec	edi		//; back up one for compare
-		mov	ecx,[end_of_data]		//; get the end of data
-		sub	ecx,esi		//; sub current source for max len
-
-		repe	cmpsb		//; see how many bytes match
-
-		jne	short notend	//; if found mismatch then di - bx = match count
-
-		inc	edi		//; else cx = 0 and di + 1 - bx = match count
-	}
-notend:
-	__asm {
-		mov	esi,edx		//; restore si
-		mov	eax,edi		//; get the dest
-		sub	eax,ebx		//; sub the start for total bytes that match
-		mov	edi,ebx		//; restore dest
-		cmp	eax,[count]	//; see if its better than before
-		jb	searchloop	//; if not keep looking
-
-		mov	[count],eax	//; if so keep the count
-		dec	ebx		//; back it up for the actual match offset
-		mov	[matchoff],ebx //; save the offset for later
-		jmp	searchloop	//; loop until we searched it all
-	}
-searchdone:
-	__asm {
-		mov	ecx,[count]	//; get the count of the longest run
-		mov	edi,[ndest]	//; get the offset of our compressed data
-		cmp	ecx,2		//; see if its not enough run to matter
-		jbe	short lenin		//; if its 0,1, or 2 its too small
-
-		cmp	ecx,10		//; if not, see if it would fit in a short
-		ja	short medrun	//; if not, see if its a medium run
-
-		mov	eax,esi		//; if its short get the current address
-		sub	eax,[matchoff] //; sub the offset of the match
-		cmp	eax,0FFFh	//; if its less than 12 bits its a short
-		ja	short medrun	//; if its not, its a medium
-	}
-//shortrun:
-	__asm {
-		sub	ebx,ebx
-		mov	bl,cl		//; get the length (3-10)
-		sub	bl,3		//; sub 3 for a 3 bit number 0-7
-		shl	bl,4		//; shift it left 4
-		add	ah,bl		//; add in the length for the high nibble
-		xchg	ah,al		//; reverse the bytes for a word store
-		jmp	short srunnxt	//; do the run fixup code
-	}
-medrun:
-	__asm {
-		cmp	ecx,64		//; see if its a short run
-		ja	short longrun	//; if not, oh well at least its long
-
-		sub	cl,3		//; back down 3 to keep it in 6 bits
-		or	cl,0C0h		//; the highest bits are always on
-		mov	al,cl		//; put it in al for the stosb
-		stosb			//; store it
-		jmp	short medrunnxt //; do the run fixup code
-	}
-lenin:
-	__asm {
-		cmp	[inlen],0	//; is it doing a length?
-//		cmp	[DWORD PTR inlen],0	//; is it doing a length?
-		jnz	short len	//; if so, skip code
-	}
-lenin1:
-	__asm {
-		mov	[lenoff],edi	//; save the length code offset
-		mov	al,80h		//; set the length to 0
-		stosb			//; save it
-	}
-len:
-	__asm {
-		mov	ebx,[lenoff]	//; get the offset of the length code
-		cmp	[ebx],0BFh	//; see if its maxed out
-//		cmp	[BYTE PTR ebx],0BFh	//; see if its maxed out
-		je	lenin1	//; if so put out a new len code
-	}
-//stolen:
-	__asm {
-		inc	[ebx] //; inc the count code
-//		inc	[BYTE PTR ebx] //; inc the count code
-		lodsb			//; get the byte
-		stosb			//; store it
-		mov	[inlen],1	//; we are now in a length so save it
-//		mov	[DWORD PTR inlen],1	//; we are now in a length so save it
-		jmp	short nxt	//; do the next code
-	}
-longrun:
-	__asm {
-		mov	al,0ffh		//; its a long so set a code of FF
-		stosb			//; store it
-
-		mov	eax,[count]	//; send out the count
-		stosw			//; store it
-	}
-medrunnxt:
-	__asm {
-		mov	eax,[matchoff] //; get the offset
-		sub	eax,[a1stsrc]	//; make it relative tot he start of data
-	}
-srunnxt:
-	__asm {
-		stosw			//; store it
-		//; this code common to all runs
-		add	esi,[count]	//; add in the length of the run to the source
-		mov	[inlen],0	//; set the in leght flag to false
-//		mov	[DWORD PTR inlen],0	//; set the in leght flag to false
-	}
 nxt:
-	__asm {
-		cmp	esi,[end_of_data]		//; see if we did the whole pic
-		jae	short outofhere		//; if so, cool! were done
-
-		jmp	loopstart
-	}
-outofhere:
-	__asm {
-		mov	ax,080h		//; remember to send an end of data code
-		stosb			//; store it
-		mov	eax,edi		//; get the last compressed address
-		sub	eax,[a1stdest]	//; sub the first for the compressed size
-		mov	[retval],eax
+	if (esi < end_of_data) {
+		goto loopstart;
 	}
 
-	return(retval);
+	*edi++ = 0x80;
+	return (int)(edi - a1stdest);
 }
-#endif
 
