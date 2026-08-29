@@ -20,7 +20,9 @@
 #include "gametime.h"
 #include "vqaplayp.h"
 
+#include <atomic>
 #include <cassert>
+#include <mutex>
 
 /// use of this is a bug..
 #ifndef DSBCAPS_GETCURRENTPOSITION2
@@ -28,6 +30,22 @@
 #endif
 
 Ahandle _handles[Ahandle::MAX_HANDLES];
+
+/// Kept outside Ahandle itself: Open_Audio_Handler memsets the whole struct on every
+/// reopen, which would corrupt a std::mutex/std::atomic member instead of just
+/// re-zeroing it.
+static std::mutex _handle_mutexes[Ahandle::MAX_HANDLES];
+static std::atomic<long> _handle_suspend_audio_callback[Ahandle::MAX_HANDLES];
+
+inline std::mutex & Handle_Mutex(Ahandle const * handle)
+{
+	return _handle_mutexes[handle - _handles];
+}
+
+inline std::atomic<long> & Handle_Suspend_Audio_Callback(Ahandle const * handle)
+{
+	return _handle_suspend_audio_callback[handle - _handles];
+}
 
 bool _restore_primary = false;
 WAVEFORMATEX _restore_format;
@@ -107,7 +125,7 @@ unsigned long Get_Playback_Position(VQAHandle *vqa, Ahandle *audio, VQAConfig *c
 	DWORD				play_cursor;		//Position that direct sound is reading from
 	DWORD				write_cursor;		//Position in buffer that we can write to
 
-	EnterCriticalSection(&audio->CriticalSection);
+	Handle_Mutex(audio).lock();
 
 	long r = vqap->RepeatedBuffers;
 	long l = audio->LastChunkPosition;
@@ -130,7 +148,7 @@ unsigned long Get_Playback_Position(VQAHandle *vqa, Ahandle *audio, VQAConfig *c
 		}
 	}
 
-	LeaveCriticalSection(&audio->CriticalSection);
+	Handle_Mutex(audio).unlock();
 
 	dma_diff = totalbytes - config->HMIBufSize * r;
 	if (dma_diff > totalbytes) {
@@ -217,8 +235,6 @@ long __cdecl Open_Audio_Handler(VQAHandleP *vqap, AhandleInitParams *params, lon
 		memset(handle, 0, sizeof(*handle));
 		handle->Used = TRUE;
 		handle->Volume = config->Volume;
-
-		InitializeCriticalSection(&handle->CriticalSection);
 
 		if (config->AudioRate != -1) {
 			handle->SampleRate = config->AudioRate;
@@ -337,8 +353,6 @@ long __cdecl Close_Audio_Handler(VQAHandleP *vqap)
 			DebugString("Audio.Unlock_Mutex()\n");
 			Audio.Unlock_Mutex();
 		}
-		DebugString("Deleting the critical section object\n");
-		DeleteCriticalSection(&handle->CriticalSection);
 	}
 
 	DebugString("VQ audio handler closed OK\n");
@@ -356,7 +370,7 @@ long __cdecl Start_Audio_Handler(VQAHandleP *vqap)
 		return(Play_Audio_Handler(vqap));
 	}
 
-	EnterCriticalSection(&audio->CriticalSection);
+	Handle_Mutex(audio).lock();
 
 	assert(audio->SecondaryBufferPtr == NULL);
 
@@ -398,7 +412,7 @@ long __cdecl Start_Audio_Handler(VQAHandleP *vqap)
 	Audio.Unlock_Mutex();
 
 	if (audio->SecondaryBufferPtr == NULL) {
-		LeaveCriticalSection(&audio->CriticalSection);
+		Handle_Mutex(audio).unlock();
 		return(VQAERR_AUDIO);
 	}
 
@@ -416,7 +430,7 @@ long __cdecl Start_Audio_Handler(VQAHandleP *vqap)
 	audio->SecondaryBufferPtr->SetVolume(Convert_HMI_To_Direct_Sound_Volume(audio->Volume & 255));
 
 	HRESULT return_code = audio->SecondaryBufferPtr->Play(0, 0, DSBPLAY_LOOPING);
-	LeaveCriticalSection(&audio->CriticalSection);
+	Handle_Mutex(audio).unlock();
 	return(return_code == DS_OK ? VQAERR_NONE : VQAERR_AUDIO);
 }
 
@@ -426,9 +440,9 @@ long __cdecl Load_Audio_Handler(VQAHandleP *vqap, void *buffer, long nbytes)
 	Ahandle *handle = &_handles[vqap->AudioHandleIndex];
 
 	if (buffer != NULL && nbytes != 0) {
-		EnterCriticalSection(&handle->CriticalSection);
+		Handle_Mutex(handle).lock();
 		if (handle->AudioBufInUse[handle->AudioBufReadIndex] == TRUE) {
-			LeaveCriticalSection(&handle->CriticalSection);
+			Handle_Mutex(handle).unlock();
 			return(VQAERR_AUDIO);
 		}
 		int readindex = handle->AudioBufReadIndex;
@@ -441,7 +455,7 @@ long __cdecl Load_Audio_Handler(VQAHandleP *vqap, void *buffer, long nbytes)
 			index = 0;
 		}
 		handle->AudioBufReadIndex = index;
-		LeaveCriticalSection(&handle->CriticalSection);
+		Handle_Mutex(handle).unlock();
 		return(VQAERR_NONE);
 	}
 	return(VQAERR_AUDIO);
@@ -452,14 +466,14 @@ long __cdecl Pause_Audio_Handler(VQAHandleP *vqap)
 {
 	Ahandle *handle = &_handles[vqap->AudioHandleIndex];
 
-	EnterCriticalSection(&handle->CriticalSection);
+	Handle_Mutex(handle).lock();
 
 	if (handle->Used == true && handle->SecondaryBufferPtr != NULL) {
 		handle->SecondaryBufferPtr->Stop();
 	}
 	handle->Flags |= AHANDLEF_IS_PAUSED;
 
-	LeaveCriticalSection(&handle->CriticalSection);
+	Handle_Mutex(handle).unlock();
 
 	return(VQAERR_NONE);
 }
@@ -474,7 +488,7 @@ long __cdecl Play_Audio_Handler(VQAHandleP *vqap)
 		return(VQAERR_AUDIO);
 	}
 
-	EnterCriticalSection(&handle->CriticalSection);
+	Handle_Mutex(handle).lock();
 
 	rc = handle->SecondaryBufferPtr->Play(0, 0, DSBPLAY_LOOPING);
 	if (rc == S_OK) {
@@ -485,7 +499,7 @@ long __cdecl Play_Audio_Handler(VQAHandleP *vqap)
 	} else {
 		rc = VQAERR_AUDIO;
 	}
-	LeaveCriticalSection(&handle->CriticalSection);
+	Handle_Mutex(handle).unlock();
 
 	return(rc);
 }
@@ -497,7 +511,7 @@ long __cdecl Stop_Audio_Handler(VQAHandleP *vqap)
 
 	if (handle->SecondaryBufferPtr != NULL) {
 
-		EnterCriticalSection(&handle->CriticalSection);
+		Handle_Mutex(handle).lock();
 		handle->SecondaryBufferPtr->Stop();
 		handle->SecondaryBufferPtr->Release();
 		handle->SecondaryBufferPtr = NULL;
@@ -507,7 +521,7 @@ long __cdecl Stop_Audio_Handler(VQAHandleP *vqap)
 			handle->AudioBufInUse[i] = false;
 		}
 
-		LeaveCriticalSection(&handle->CriticalSection);
+		Handle_Mutex(handle).unlock();
 	}
 	return(VQAERR_NONE);
 }
@@ -549,23 +563,23 @@ void CALLBACK AudioCallback ( UINT uTimerID, UINT, DWORD dwUser, DWORD, DWORD )
 
 	audio = &_handles[vqap->AudioHandleIndex];
 
-	if (InterlockedIncrement(&audio->SuspendAudioCallback) != TRUE || (audio->Flags & AHANDLEF_IS_PAUSED)) {
-		InterlockedDecrement(&audio->SuspendAudioCallback);
+	if (Handle_Suspend_Audio_Callback(audio).fetch_add(1) + 1 != 1 || (audio->Flags & AHANDLEF_IS_PAUSED)) {
+		Handle_Suspend_Audio_Callback(audio).fetch_sub(1);
 		return;
 	}
 
-	EnterCriticalSection(&audio->CriticalSection);
+	Handle_Mutex(audio).lock();
 
 	if (!audio->SecondaryBufferPtr || audio->TimerHandle != uTimerID)  {
-		LeaveCriticalSection(&audio->CriticalSection);
-		InterlockedDecrement(&audio->SuspendAudioCallback);
+		Handle_Mutex(audio).unlock();
+		Handle_Suspend_Audio_Callback(audio).fetch_sub(1);
 		return;
 	}
 
 	return_code = audio->SecondaryBufferPtr->GetStatus(&status);
 	if (!(status & DSBSTATUS_PLAYING) && !(status & DSBSTATUS_LOOPING)) {
-		LeaveCriticalSection(&audio->CriticalSection);
-		InterlockedDecrement(&audio->SuspendAudioCallback);
+		Handle_Mutex(audio).unlock();
+		Handle_Suspend_Audio_Callback(audio).fetch_sub(1);
 		return;
 	}
 
@@ -619,8 +633,8 @@ void CALLBACK AudioCallback ( UINT uTimerID, UINT, DWORD dwUser, DWORD, DWORD )
 			audio->SecondaryBufferPtr->Play(0,0,DSBPLAY_LOOPING);
 		}
 	}
-	LeaveCriticalSection(&audio->CriticalSection);
-	InterlockedDecrement(&audio->SuspendAudioCallback);
+	Handle_Mutex(audio).unlock();
+	Handle_Suspend_Audio_Callback(audio).fetch_sub(1);
 }
 
 
@@ -730,12 +744,12 @@ void Pause_All_Audio_Handler(void)
 		Ahandle *handle = &_handles[i];
 		if (handle->Used == true && handle->SecondaryBufferPtr != NULL) {
 
-			EnterCriticalSection(&handle->CriticalSection);
+			Handle_Mutex(handle).lock();
 
 			handle->SecondaryBufferPtr->Stop();
 			handle->Flags |= AHANDLEF_IS_PAUSED;
 
-			LeaveCriticalSection(&handle->CriticalSection);
+			Handle_Mutex(handle).unlock();
 
 		}
 	}
@@ -748,12 +762,12 @@ void Resume_All_Audio_Handler(void)
 		Ahandle *handle = &_handles[i];
 		if (handle->Used == true && handle->SecondaryBufferPtr != NULL) {
 
-			EnterCriticalSection(&handle->CriticalSection);
+			Handle_Mutex(handle).lock();
 
 			handle->SecondaryBufferPtr->Play(0, 0, DSBPLAY_LOOPING);
 			handle->Flags &= ~AHANDLEF_IS_PAUSED;
 
-			LeaveCriticalSection(&handle->CriticalSection);
+			Handle_Mutex(handle).unlock();
 
 		}
 	}

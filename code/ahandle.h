@@ -64,8 +64,6 @@ struct Ahandle {
 	unsigned long ChunksMovedToAudioBuffer;
 	unsigned long LastChunkPosition;
 	unsigned long EndLastAudioChunk;
-	CRITICAL_SECTION CriticalSection;
-	LONG SuspendAudioCallback;
 };
 
 unsigned long __cdecl Simple_Timer_Callback_Audio_Handler(VQAHandle *vqa);

@@ -62,6 +62,4 @@ extern	void (*Audio_Focus_Loss_Function)(void);
 
 extern int Misc;
 
-extern CRITICAL_SECTION	GlobalAudioCriticalSection;
-
 extern int StreamLowImpact;
